@@ -1,8 +1,8 @@
 ---
 id: baby-age
 name: Baby Age
-summary: Display Baby Age
-desc: Displays your baby's age in days, weeks, and months!
+summary: Show your baby's age
+desc: Shows how old your baby is in hours, days, weeks, months or years, with an exact breakdown underneath. Set a future date to count down to the due date.
 author: helmc2
 fileName: baby_age.star
 packageName: babyage
