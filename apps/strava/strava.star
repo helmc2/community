@@ -147,6 +147,8 @@ def main(config):
         return athlete_stats(config, refresh_token, display_type, sport, units)
     elif display_type == "progress_chart":
         return progress_chart(config, refresh_token, sport, units)
+    elif display_type == "week":
+        return week_view(config, refresh_token, sport, units)
     elif display_type == "last_activity":
         return last_activity(config, refresh_token, sport, units)
     else:
@@ -164,13 +166,13 @@ def progress_chart(config, refresh_token, sport, units):
     activities = get_activities(config, refresh_token)
 
     # This is duped from the get_activities function but we still need this info for this display
-    timezone = config.get("timezone") or "America/New_York"
+    timezone = config.get("$tz", "America/New_York")
     now = time.now().in_location(timezone)
-    beg_curr_month = time.time(year = now.year, month = now.month, day = 1)
-    _next_month = time.time(year = now.year, month = now.month, day = 32)
-    end_curr_month = time.time(year = _next_month.year, month = _next_month.month, day = 1) - time.parse_duration("1ns")
+    beg_curr_month = time.time(year = now.year, month = now.month, day = 1, location = timezone)
+    _next_month = time.time(year = now.year, month = now.month, day = 32, location = timezone)
+    end_curr_month = time.time(year = _next_month.year, month = _next_month.month, day = 1, location = timezone) - time.parse_duration("1ns")
     end_prev_month = beg_curr_month - time.parse_duration("1ns")
-    beg_prev_month = time.time(year = end_prev_month.year, month = end_prev_month.month, day = 1)
+    beg_prev_month = time.time(year = end_prev_month.year, month = end_prev_month.month, day = 1, location = timezone)
 
     stat_keys = ("distance", "moving_time", "total_elevation_gain")
     graph_stat = stat_keys[0]
@@ -180,7 +182,7 @@ def progress_chart(config, refresh_token, sport, units):
     included_current_activities = []
     cumulative_current = {k: 0 for k in stat_keys}
     for item in activities["current"]:
-        if item["type"].lower() == sport:
+        if item.get("sport_type", item["type"]) in SPORT_TYPES[sport]:
             activity_time = time.parse_time(item["start_date"])
             activity_epoch = activity_time.unix
             activity_stats = {k: item.get(k, 0) for k in stat_keys}
@@ -199,7 +201,7 @@ def progress_chart(config, refresh_token, sport, units):
     included_previous_activities = []
     cumulative_previous = {k: 0 for k in stat_keys}
     for item in activities["previous"]:
-        if item["type"].lower() == sport:
+        if item.get("sport_type", item["type"]) in SPORT_TYPES[sport]:
             activity_time = time.parse_time(item["start_date"])
             activity_epoch = activity_time.unix
             activity_stats = {k: item.get(k, 0) for k in stat_keys}
@@ -398,7 +400,7 @@ def progress_chart(config, refresh_token, sport, units):
 
 def athlete_stats(config, refresh_token, period, sport, units):
     no_anim = config.bool("no_anim", False) or config.bool("$widget")
-    timezone = config.get("timezone") or "America/New_York"
+    timezone = config.get("$tz", "America/New_York")
     year = time.now().in_location(timezone).year
 
     if not refresh_token:
@@ -927,21 +929,146 @@ def last_activity(config, refresh_token, sport, units):
         ),
     )
 
+STRAVA_ORANGE = "#FC4C02"
+WEEK_CACHE_TTL = 60 * 60
+WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+SPORT_TYPES = {
+    "ride": ["Ride", "VirtualRide", "EBikeRide", "GravelRide", "MountainBikeRide", "EMountainBikeRide", "Velomobile", "Handcycle"],
+    "run": ["Run", "TrailRun", "VirtualRun"],
+    "swim": ["Swim"],
+}
+
+# Daily distances in meters for the preview: last week, then this week.
+PREVIEW_WEEK = [41000, 26500, 34000, 26500, 47000, 76000, 0, 41100, 23500, 45600, 38500, 55200, 0, 0]
+
+def week_view(config, refresh_token, sport, units):
+    tz = config.get("$tz", "America/New_York")
+    now = time.now().in_location(tz)
+    today_idx = WEEKDAYS.index(now.format("Monday"))
+    last_monday = time.time(year = now.year, month = now.month, day = now.day - today_idx - 7, location = tz)
+
+    if refresh_token:
+        activities = get_week_activities(refresh_token, last_monday)
+        if type(activities) != "list":
+            return activities  # error screen
+        daily = [0.0] * 14
+        for a in activities:
+            if a.get("sport_type", a.get("type")) not in SPORT_TYPES[sport]:
+                continue
+            t = time.parse_time(a["start_date"]).in_location(tz)
+            day = time.time(year = t.year, month = t.month, day = t.day, location = tz)
+            idx = int((day - last_monday).hours / 24 + 0.5)
+            if idx >= 0 and idx < 14:
+                daily[idx] += a.get("distance", 0)
+    else:
+        daily = [float(d) for d in PREVIEW_WEEK]
+        for i in range(8 + today_idx, 14):
+            daily[i] = 0.0
+
+    conv = meters_to_mi if units == "imperial" else (lambda m: m / 1000.0)
+    unit = "mi" if units == "imperial" else "km"
+    last_week = [conv(d) for d in daily[:7]]
+    this_week = [conv(d) for d in daily[7:]]
+
+    total = total_of(this_week)
+    delta = total - total_of(last_week[:today_idx + 1])
+
+    header = render.Row(
+        expanded = True,
+        main_align = "space_between",
+        cross_align = "end",
+        children = [
+            render.Text("%s %s" % (fmt_distance(total), unit), font = "tb-8"),
+            render.Text(
+                ("+" if delta >= 0 else "-") + str(int(abs(delta) + 0.5)),
+                font = "tom-thumb",
+                color = "#5BD15B" if delta >= 0 else "#FF6B6B",
+            ),
+        ],
+    )
+
+    bar_height = 16
+    peak = max(last_week + this_week + [1.0])
+    bars = []
+    labels = []
+    for i in range(7):
+        ghost = scaled(last_week[i], peak, bar_height)
+        current = scaled(this_week[i], peak, bar_height)
+        bars.append(render.Stack(children = [
+            bottom_bar(7, ghost, "#333", bar_height),
+            render.Padding(pad = (1, 0, 0, 0), child = bottom_bar(5, current, STRAVA_ORANGE if i == today_idx else "#FFF", bar_height)),
+        ]))
+        labels.append(render.Box(
+            width = 7,
+            height = 6,
+            child = render.Text("MTWTFSS"[i], font = "tom-thumb", color = STRAVA_ORANGE if i == today_idx else "#777"),
+        ))
+
+    return render.Root(
+        child = render.Padding(
+            pad = (1, 0, 1, 0),
+            child = render.Column(
+                expanded = True,
+                main_align = "space_between",
+                children = [
+                    header,
+                    render.Row(expanded = True, main_align = "space_between", children = bars),
+                    render.Row(expanded = True, main_align = "space_between", children = labels),
+                ],
+            ),
+        ),
+    )
+
+def total_of(values):
+    t = 0.0
+    for v in values:
+        t += v
+    return t
+
+def scaled(value, peak, height):
+    if value <= 0:
+        return 0
+    return max(1, int(value / peak * height + 0.5))
+
+def bottom_bar(width, height, color, full_height):
+    children = [render.Box(width = width, height = height, color = color)] if height else []
+    return render.Box(
+        width = width,
+        height = full_height,
+        child = render.Column(expanded = True, main_align = "end", children = children),
+    )
+
+def fmt_distance(d):
+    if d >= 100:
+        return humanize.comma(int(d + 0.5))
+    return "%s" % (int(d * 10 + 0.5) / 10.0)
+
+def get_week_activities(refresh_token, since):
+    cache_id = "%s/week/%d" % (refresh_token, since.unix)
+    data = cache.get(cache_id)
+    if data:
+        return json.decode(data)
+
+    access_token = cache.get(refresh_token) or get_access_token(refresh_token)
+    url = "%s/athlete/activities?after=%d&per_page=200" % (STRAVA_BASE, since.unix)
+    response = http_get(url, headers = {"Authorization": "Bearer %s" % access_token})
+    if response.status_code != 200:
+        return display_failure("Strava API failed, code %d" % response.status_code)
+    cache.set(cache_id, response.body(), ttl_seconds = WEEK_CACHE_TTL)
+    return response.json()
+
 def get_activities(config, refresh_token):
     max_activities = 200
 
-    timezone = config.get("timezone") or "America/New_York"
+    timezone = config.get("$tz", "America/New_York")
     now = time.now().in_location(timezone)
-    beg_curr_month = time.time(year = now.year, month = now.month, day = 1)
+    beg_curr_month = time.time(year = now.year, month = now.month, day = 1, location = timezone)
 
     end_prev_month = beg_curr_month - time.parse_duration("1ns")
-    beg_prev_month = time.time(year = end_prev_month.year, month = end_prev_month.month, day = 1)
+    beg_prev_month = time.time(year = end_prev_month.year, month = end_prev_month.month, day = 1, location = timezone)
 
     if not refresh_token:
-        activities = {
-            "current": [],
-            "previous": [],
-        }
+        activities = {"last-2": []}
     else:
         access_token = cache.get(refresh_token)
         if not access_token:
@@ -1046,7 +1173,7 @@ def meters_to_mi(m):
     return m * 0.00062137
 
 def meters_to_km(m):
-    return m // 1000
+    return m / 1000.0
 
 def meters_to_ft(m):
     return m * 3.280839895
@@ -1184,6 +1311,7 @@ def get_schema():
     screen_options = [
         schema.Option(value = "all", display = "All-time stats"),
         schema.Option(value = "ytd", display = "YTD stats"),
+        schema.Option(value = "week", display = "This week"),
         schema.Option(value = "progress_chart", display = "Monthly progress"),
         schema.Option(value = "last_activity", display = "Last activity"),
     ]
